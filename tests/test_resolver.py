@@ -97,11 +97,17 @@ async def test_ensembl_id_resolution(resolver):
     assert result.match_status == "exact"
     assert result.confidence_score == 1.0
     assert result.resolved_entity is not None
-    assert result.resolved_entity.symbol == "TP53"
-    assert result.resolved_entity.ensembl_gene_id == "ENSG00000141510"
-    assert result.resolved_entity.location is not None
-    assert result.resolved_entity.location.chromosome == "17"
-    assert len(result.resolved_entity.transcripts) > 0
+    entity = result.resolved_entity
+    assert entity.symbol == "TP53"
+    assert entity.ensembl_gene_id == "ENSG00000141510"
+    assert entity.hgnc_id == "HGNC:11998"
+    assert entity.ncbi_gene_id == "7157"
+    assert "P04637" in entity.uniprot_ids
+    assert "p53" in entity.synonyms or "LFS1" in entity.synonyms
+    assert "[Source:" not in entity.name
+    assert entity.location is not None
+    assert entity.location.chromosome == "17"
+    assert len(entity.transcripts) > 0
 
 
 @pytest.mark.asyncio

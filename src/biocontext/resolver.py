@@ -22,6 +22,7 @@ from biocontext.schemas import (
     DiseaseEntity,
     FunctionalAnnotation,
     GOAnnotation,
+    GeneEntity,
     LiteratureContext,
     MatchReason,
     PathwayContext,
@@ -112,11 +113,91 @@ class EntityResolver:
 
         return round(confidence, 2)
 
+    async def _enrich_entity(self, gene: GeneEntity, query_source: str = "generic") -> GeneEntity:
+        """Universally reconcile cross-database IDs and annotations across HGNC, UniProt, and Ensembl."""
+        if not gene or not gene.symbol:
+            return gene
+
+        # 1. Human (taxon 9606): cross-enrich with HGNC if key IDs or synonyms are missing
+        if gene.taxon_id == 9606:
+            needs_hgnc = not gene.hgnc_id or not gene.ncbi_gene_id or not gene.ensembl_gene_id or not gene.synonyms
+            if needs_hgnc:
+                try:
+                    hgnc_match = await self.hgnc.fetch_by_symbol(gene.symbol)
+                    if hgnc_match:
+                        if not gene.hgnc_id and hgnc_match.hgnc_id:
+                            gene.hgnc_id = hgnc_match.hgnc_id
+                        if not gene.ncbi_gene_id and hgnc_match.ncbi_gene_id:
+                            gene.ncbi_gene_id = hgnc_match.ncbi_gene_id
+                        if not gene.ensembl_gene_id and hgnc_match.ensembl_gene_id:
+                            gene.ensembl_gene_id = hgnc_match.ensembl_gene_id
+                        if not gene.name and hgnc_match.name:
+                            gene.name = hgnc_match.name
+                        if hgnc_match.synonyms:
+                            current_syns = set(gene.synonyms or [])
+                            for s in hgnc_match.synonyms:
+                                if s not in current_syns:
+                                    gene.synonyms.append(s)
+                                    current_syns.add(s)
+                except Exception as e:
+                    logger.debug(f"HGNC back-enrichment skipped: {e}")
+
+            # 2. Reconcile UniProt Accession ID if missing
+            if not gene.uniprot_ids:
+                try:
+                    u_res = await self.uniprot.resolve_gene(gene.symbol, taxon_id=9606)
+                    if u_res and "accession" in u_res:
+                        acc = u_res["accession"]
+                        if acc not in gene.uniprot_ids:
+                            gene.uniprot_ids.append(acc)
+                except Exception as e:
+                    logger.debug(f"UniProt back-enrichment skipped: {e}")
+
+            # 3. Reconcile Ensembl model if transcripts or genomic coordinates are missing
+            if (not gene.transcripts or not gene.location or not gene.location.start) and gene.ensembl_gene_id:
+                try:
+                    ens_match = await self.ensembl.fetch_by_id(gene.ensembl_gene_id)
+                    if ens_match:
+                        if not gene.transcripts and ens_match.transcripts:
+                            gene.transcripts = ens_match.transcripts
+                        if (not gene.location or not gene.location.start) and ens_match.location:
+                            gene.location = ens_match.location
+                except Exception as e:
+                    logger.debug(f"Ensembl transcript back-enrichment skipped: {e}")
+
+        # 4. Mouse (taxon 10090): cross-enrich MGI and Ensembl IDs
+        elif gene.taxon_id == 10090:
+            if not gene.mgi_id and gene.ensembl_gene_id:
+                try:
+                    mgi_id = await self.ensembl.fetch_mgi_id(gene.ensembl_gene_id)
+                    if mgi_id:
+                        gene.mgi_id = mgi_id
+                except Exception as e:
+                    logger.debug(f"MGI cross-enrichment skipped: {e}")
+            elif not gene.ensembl_gene_id and gene.symbol:
+                try:
+                    ens_mouse = await self.ensembl.fetch_by_symbol(species="mus_musculus", symbol=gene.symbol)
+                    if ens_mouse and ens_mouse.ensembl_gene_id:
+                        gene.ensembl_gene_id = ens_mouse.ensembl_gene_id
+                        if ens_mouse.transcripts and not gene.transcripts:
+                            gene.transcripts = ens_mouse.transcripts
+                except Exception as e:
+                    logger.debug(f"Mouse Ensembl enrichment skipped: {e}")
+
+        return gene
+
     async def resolve(
         self, query: str, taxon_id: int = 9606, context: Optional[ResolutionContext] = None
     ) -> ResolutionResult:
         query_clean = query.strip()
         reasons: List[MatchReason] = []
+
+        # Top-level resolution cache (if no context clues supplied)
+        cache_key = f"res:{query_clean}:{taxon_id}"
+        if not context:
+            cached_res = self.cache.get("resolver", cache_key)
+            if cached_res:
+                return ResolutionResult(**cached_res)
 
         # 1. Primary Authority for Human: HGNC
         if taxon_id == 9606 and not query_clean.isdigit():
@@ -136,10 +217,7 @@ class EntityResolver:
                 )
 
                 # Cross-reference with UniProt if uniprot_ids missing or to enrich
-                if not gene.uniprot_ids:
-                    uniprot_res = await self.uniprot.resolve_gene(gene.symbol, taxon_id=taxon_id)
-                    if uniprot_res and "accession" in uniprot_res:
-                        gene.uniprot_ids.append(uniprot_res["accession"])
+                await self._enrich_entity(gene, query_source="hgnc")
 
                 # Apply context clues scoring adjustments if hints provided
                 final_confidence = self._apply_context_clues(gene, context, confidence, reasons)
@@ -147,13 +225,16 @@ class EntityResolver:
                 if final_confidence < 0.60:
                     match_status = "ambiguous"
 
-                return ResolutionResult(
+                out = ResolutionResult(
                     query=query_clean,
                     match_status=match_status,
                     confidence_score=final_confidence,
                     resolved_entity=gene,
                     match_reasons=reasons
                 )
+                if not context:
+                    self.cache.set("resolver", cache_key, out.model_dump())
+                return out
 
         # 2. Check direct MGI ID (e.g. MGI:98834 or MGI:xxxx)
         if query_clean.upper().startswith("MGI:"):
@@ -167,14 +248,18 @@ class EntityResolver:
                         details=f"Direct MGI ID lookup matched '{query_clean}' to mouse symbol '{mgi_gene.symbol}'"
                     )
                 )
+                await self._enrich_entity(mgi_gene, query_source="mgi")
                 final_confidence = self._apply_context_clues(mgi_gene, context, 1.0, reasons)
-                return ResolutionResult(
+                out = ResolutionResult(
                     query=query_clean,
                     match_status="exact",
                     confidence_score=final_confidence,
                     resolved_entity=mgi_gene,
                     match_reasons=reasons
                 )
+                if not context:
+                    self.cache.set("resolver", cache_key, out.model_dump())
+                return out
 
         # 3. Check Ensembl Gene ID (e.g. ENSG... or ENSMUSG...)
         if query_clean.upper().startswith("ENS"):
@@ -188,20 +273,20 @@ class EntityResolver:
                         details=f"Direct Ensembl Gene ID lookup matched '{query_clean}' to symbol '{ens_gene.symbol}'"
                     )
                 )
-                # If mouse Ensembl gene, fetch MGI ID xref
-                if ens_gene.taxon_id == 10090 and ens_gene.ensembl_gene_id:
-                    mgi_id = await self.ensembl.fetch_mgi_id(ens_gene.ensembl_gene_id)
-                    if mgi_id:
-                        ens_gene.mgi_id = mgi_id
+                # Universal reconciliation & back-enrichment (HGNC, UniProt, MGI)
+                await self._enrich_entity(ens_gene, query_source="ensembl")
 
                 final_confidence = self._apply_context_clues(ens_gene, context, 1.0, reasons)
-                return ResolutionResult(
+                out = ResolutionResult(
                     query=query_clean,
                     match_status="exact",
                     confidence_score=final_confidence,
                     resolved_entity=ens_gene,
                     match_reasons=reasons
                 )
+                if not context:
+                    self.cache.set("resolver", cache_key, out.model_dump())
+                return out
 
         # 4. If query is numeric (Entrez ID) and human (9606), check HGNC first (authoritative and no strict 3 req/s throttle)
         if query_clean.isdigit() and taxon_id == 9606:
@@ -216,13 +301,16 @@ class EntityResolver:
                     )
                 )
                 final_confidence = self._apply_context_clues(hgnc_entrez_gene, context, 1.0, reasons)
-                return ResolutionResult(
+                out = ResolutionResult(
                     query=query_clean,
                     match_status="exact",
                     confidence_score=final_confidence,
                     resolved_entity=hgnc_entrez_gene,
                     match_reasons=reasons
                 )
+                if not context:
+                    self.cache.set("resolver", cache_key, out.model_dump())
+                return out
 
         # 5. Check Entrez Gene ID lookup or cross-species / fallback via NCBI
         ncbi_res = await self.ncbi.resolve_gene(query_clean, taxon_id=taxon_id)
@@ -245,13 +333,16 @@ class EntityResolver:
                 if hgnc_gene:
                     if not hgnc_gene.ncbi_gene_id:
                         hgnc_gene.ncbi_gene_id = ncbi_gene.ncbi_gene_id
-                    return ResolutionResult(
+                    out = ResolutionResult(
                         query=query_clean,
                         match_status="exact" if query_clean.isdigit() else "ncbi_matched",
                         confidence_score=confidence,
                         resolved_entity=hgnc_gene,
                         match_reasons=reasons
                     )
+                    if not context:
+                        self.cache.set("resolver", cache_key, out.model_dump())
+                    return out
 
             # If mouse (10090), check Ensembl to enrich MGI ID and transcripts
             if taxon_id == 10090 and ncbi_gene.symbol:
@@ -265,15 +356,18 @@ class EntityResolver:
                     if ens_mouse.transcripts:
                         ncbi_gene.transcripts = ens_mouse.transcripts
 
-            return ResolutionResult(
+            out = ResolutionResult(
                 query=query_clean,
                 match_status="exact" if query_clean.isdigit() else "ncbi_matched",
                 confidence_score=confidence,
                 resolved_entity=ncbi_gene,
                 match_reasons=reasons
             )
+            if not context:
+                self.cache.set("resolver", cache_key, out.model_dump())
+            return out
 
-        # 4. Check UniProt directly (accession lookup e.g. P04637)
+        # 6. Check UniProt directly (accession lookup e.g. P04637)
         uniprot_protein = await self.uniprot.fetch_by_accession(query_clean)
         if uniprot_protein and uniprot_protein.gene_symbol:
             reasons.append(
@@ -289,13 +383,17 @@ class EntityResolver:
             if gene:
                 if uniprot_protein.accession not in gene.uniprot_ids:
                     gene.uniprot_ids.append(uniprot_protein.accession)
-                return ResolutionResult(
+                await self._enrich_entity(gene, query_source="uniprot")
+                out = ResolutionResult(
                     query=query_clean,
                     match_status="exact",
                     confidence_score=0.95,
                     resolved_entity=gene,
                     match_reasons=reasons
                 )
+                if not context:
+                    self.cache.set("resolver", cache_key, out.model_dump())
+                return out
 
         # 5. Fuzzy Match Engine: Check for common typos (e.g. TP54 -> TP53, BRCA -> BRCA1)
         if taxon_id == 9606 and len(query_clean) >= 3 and not query_clean.isdigit():
